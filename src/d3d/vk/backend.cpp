@@ -667,6 +667,8 @@ bool VulkanBackend::FinishDevice() {
     wide_lines_ = feat.wideLines == VK_TRUE;
     line_max_ = pr.limits.lineWidthRange[1];
     point_max_ = feat.largePoints == VK_TRUE ? pr.limits.pointSizeRange[1] : 1.0f;
+    std::fprintf(stderr, "[PRIM] device: wide lines %s (up to %g px), points up to %g px\n",
+                 wide_lines_ ? "yes" : "no", line_max_, point_max_);
     ms_counts_ = pr.limits.framebufferColorSampleCounts & pr.limits.framebufferDepthSampleCounts &
                  pr.limits.framebufferStencilSampleCounts;
     ReadQuality();
@@ -1873,6 +1875,47 @@ VkPipeline VulkanBackend::Pipeline(const PipeKey& k) {
 // Lines, or triangles drawn as their edges: the pipelines with a line width.
 static bool Lines(const PipeKey& k) { return k.topo == 1 || k.fill == 0x1B01; }
 
+// Test logging (#51 on the Mac): how lines and points were asked for and what was drawn, summed over
+// about 10 s of frames and printed when any were drawn. Sizes are in target pixels.
+static struct {
+    uint64_t lines = 0, lines_clamped = 0, points = 0, points_prog = 0, points_capped = 0;
+    float line_want = 0, line_used = 0, point_want = 0, point_cap = 0;
+    uint32_t since = 0;
+} g_prim;
+
+static void PrimLine(float want, float used)
+{
+    g_prim.lines++;
+    if (want > used + 0.01f) g_prim.lines_clamped++;
+    g_prim.line_want = std::max(g_prim.line_want, want);
+    g_prim.line_used = std::max(g_prim.line_used, used);
+}
+
+static void PrimPoint(bool prog, float want, float cap)
+{
+    g_prim.points++;
+    if (prog) { g_prim.points_prog++; return; }   // the size comes from the vertex shader: not known here
+    if (want > cap + 0.01f) g_prim.points_capped++;
+    g_prim.point_want = std::max(g_prim.point_want, want);
+    g_prim.point_cap = std::max(g_prim.point_cap, cap);
+}
+
+static void PrimReport(uint32_t presents)
+{
+    if (presents - g_prim.since < 600) return;
+    if (g_prim.lines)
+        std::fprintf(stderr, "[PRIM] frames %u-%u: %llu line draws, widest asked %.2f px, drawn %.2f px, %llu narrowed\n",
+                     g_prim.since, presents, (unsigned long long)g_prim.lines, g_prim.line_want, g_prim.line_used,
+                     (unsigned long long)g_prim.lines_clamped);
+    if (g_prim.points)
+        std::fprintf(stderr, "[PRIM] frames %u-%u: %llu point draws (%llu shader-sized), largest asked %.2f px, "
+                     "cap %.2f px, %llu capped\n", g_prim.since, presents, (unsigned long long)g_prim.points,
+                     (unsigned long long)g_prim.points_prog, g_prim.point_want, g_prim.point_cap,
+                     (unsigned long long)g_prim.points_capped);
+    g_prim = {};
+    g_prim.since = presents;
+}
+
 VkPipeline VulkanBackend::MakePipeline(const PipeKey& k, VkShaderModule vs, VkShaderModule ps) {
     VkPipeline pipe = VK_NULL_HANDLE;
     if (vs && ps) {
@@ -2500,8 +2543,11 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
                   s.rs[kRsPointScaleEnable] ? 1.0f : 0.0f};
         v[191] = {Bits(s.rs[kRsPointScaleA]), Bits(s.rs[kRsPointScaleB]), Bits(s.rs[kRsPointScaleC]), vh};
         vc = Upload(v.data(), sizeof(v), ringAlign_);
+        // D3DRS_POINTSIZE before attenuation, against the clamp above (both in target pixels)
+        PrimPoint(false, Bits(s.rs[kRsPointSize]) * c.surf[3], std::min(mx, point_max_ / c.surf[3]) * c.surf[3]);
     } else {
         vc = Upload(s.vsc.data(), sizeof(s.vsc), ringAlign_);
+        if (points) PrimPoint(true, 0, 0);
     }
     VkDeviceSize dc = Upload(&c, sizeof(c), ringAlign_);
 
@@ -2597,8 +2643,13 @@ void VulkanBackend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t
     Color(SimpleState(s, kMBlendColor), bf);
     d_.vkCmdSetBlendConstants(cmd_, bf);
     d_.vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, SimpleState(s, kMStencilRef) & 0xFF);
-    if (Lines(k))   // D3DRS_LINEWIDTH, in the game's pixels: at the target's scale
-        d_.vkCmdSetLineWidth(cmd_, wide_lines_ ? std::clamp(Bits(s.rs[kRsLineWidth]) * sx, 1.0f, line_max_) : 1.0f);
+    if (Lines(k)) {   // D3DRS_LINEWIDTH, in the game's pixels: at the target's scale
+        float want = Bits(s.rs[kRsLineWidth]) * sx;
+        float used = wide_lines_ ? std::clamp(want, 1.0f, line_max_) : 1.0f;
+        d_.vkCmdSetLineWidth(cmd_, used);
+        PrimLine(want, used);
+    }
+    PrimReport(presents_);
 
     VkBuffer bufs[16];
     for (uint32_t b = 0; b < a.buffer_count; b++) bufs[b] = ring_;
