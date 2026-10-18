@@ -275,8 +275,14 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 #include <SDL.h>
 
 static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
+static SDL_JoystickID g_pad_id[XBOX_MAX_CONTROLLERS];   /* each slot's instance id, -1 empty */
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
 static DWORD g_packet[XBOX_MAX_CONTROLLERS];
+
+/* The controller last pressed: it plays as port 0, so the pad in your hands
+ * drives the game when other controllers (a fight stick, a second pad) were
+ * attached first. -1 none yet: the slots in the order they were opened. */
+static volatile SDL_JoystickID g_last_pad = -1;
 
 /* Controllers are opened and closed on the thread that pumps SDL events --
  * the window's -- through an event watch, so hotplug works and nothing here
@@ -293,6 +299,7 @@ static void open_controllers(void)
         if (g_pads[s] && !SDL_GameControllerGetAttached(g_pads[s])) {
             SDL_GameControllerClose(g_pads[s]);
             g_pads[s] = NULL;
+            g_pad_id[s] = -1;
             g_controller_connected[s] = FALSE;
         }
     for (int i = 0; i < SDL_NumJoysticks(); i++) {
@@ -312,6 +319,7 @@ static void open_controllers(void)
         if (s == XBOX_MAX_CONTROLLERS)
             break;
         g_pads[s] = SDL_GameControllerOpen(i);
+        g_pad_id[s] = g_pads[s] ? id : -1;
         g_controller_connected[s] = g_pads[s] != NULL;
         if (g_pads[s])
             fprintf(stderr, "[INPUT] pad %d: %s\n", s + 1,
@@ -368,13 +376,32 @@ static int SDLCALL pad_event_watch(void *unused, SDL_Event *ev)
         break;
     case SDL_CONTROLLERBUTTONDOWN:
         set_kbm(0);
+        __atomic_store_n(&g_last_pad, ev->cbutton.which, __ATOMIC_RELEASE);
         break;
     case SDL_CONTROLLERAXISMOTION:
-        if (abs(ev->caxis.value) > 12000)
+        if (abs(ev->caxis.value) > 12000) {
             set_kbm(0);
+            __atomic_store_n(&g_last_pad, ev->caxis.which, __ATOMIC_RELEASE);
+        }
         break;
     }
     return 0;
+}
+
+/* The slot read for a game port: port 0 and the last pressed controller's
+ * slot trade places, the other ports keep theirs. Reads only the ids, which
+ * the event watch may not lock for (see pad_event_watch). */
+static DWORD slot_for_port(DWORD port)
+{
+    SDL_JoystickID last = __atomic_load_n(&g_last_pad, __ATOMIC_ACQUIRE);
+    DWORD k;
+    if (last < 0)
+        return port;
+    for (k = 0; k < XBOX_MAX_CONTROLLERS && g_pad_id[k] != last; k++)
+        ;
+    if (k == XBOX_MAX_CONTROLLERS || k == 0)
+        return port;   /* unplugged since, or already port 0 */
+    return port == 0 ? k : port == k ? 0 : port;
 }
 
 int xbox_InputKeyboardActive(void)
@@ -418,6 +445,8 @@ void xbox_InputInit(void)
     if (done)
         return;
     done = 1;
+    for (int s = 0; s < XBOX_MAX_CONTROLLERS; s++)
+        g_pad_id[s] = -1;   /* instance ids start at 0 */
     g_pad_lock = SDL_CreateMutex();
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
@@ -528,7 +557,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 
-    SDL_GameController *c = g_pad_lock ? g_pads[dwPort] : NULL;
+    DWORD slot = slot_for_port(dwPort);
+    SDL_GameController *c = g_pad_lock ? g_pads[slot] : NULL;
     if (!c || !SDL_GameControllerGetAttached(c)) {
         g_controller_connected[dwPort] = FALSE;
         if (dwPort == 0 && keyboard_mode() && g_pad_lock) {
@@ -543,7 +573,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         return ERROR_SUCCESS;
     }
     SDL_LockMutex(g_pad_lock);
-    c = g_pads[dwPort];
+    c = g_pads[slot];
     if (!c) {
         SDL_UnlockMutex(g_pad_lock);
         return ERROR_DEVICE_NOT_CONNECTED;
@@ -628,7 +658,7 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
     if (!g_pad_lock)
         return ERROR_DEVICE_NOT_CONNECTED;
     SDL_LockMutex(g_pad_lock);
-    SDL_GameController *c = g_pads[dwPort];
+    SDL_GameController *c = g_pads[slot_for_port(dwPort)];
     /* SDL rumble needs a duration; refresh for ~1s on each call (the game
      * polls vibration continuously). */
     if (c)
@@ -649,7 +679,7 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
     (void)dwFlags;
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
         return ERROR_DEVICE_NOT_CONNECTED;
-    if (!g_pads[dwPort])
+    if (!g_pads[slot_for_port(dwPort)])
         return ERROR_DEVICE_NOT_CONNECTED;
 
     memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
